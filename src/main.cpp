@@ -1,11 +1,5 @@
 #include <Arduino.h>
-#include <SoftwareSerial.h>
 #include <AccelStepper.h>
-
-// Bluetooth HC-05
-#define BT_RX 2
-#define BT_TX 3
-SoftwareSerial BTSerial(BT_RX, BT_TX);
 
 // Пины для драйверов A4988
 #define STEP_X 4
@@ -17,15 +11,19 @@ SoftwareSerial BTSerial(BT_RX, BT_TX);
 #define RELAY_PIN 8
 
 #define STEPS_PER_REV 200
-const float SPEED = STEPS_PER_REV / 0.5;  // 2 оборот = 1 секунд
+const float SPEED = STEPS_PER_REV / 0.5;  // 2 оборота = 1 секунда
 
-// Создаем два объекта AccelStepper (в режиме DRIVER)
+// Два шаговых мотора
 AccelStepper stepperX(AccelStepper::DRIVER, STEP_X, DIR_X);
 AccelStepper stepperY(AccelStepper::DRIVER, STEP_Y, DIR_Y);
 
 void setup() {
-  Serial.begin(9600);
-  BTSerial.begin(9600);
+  // Запускаем USB CDC (Serial)
+  Serial.begin(115200);
+  while (!Serial) {
+    delay(10);  // Ждем готовности USB CDC
+  }
+  Serial.println("ESP32-S3 USB CDC готов к приёму команд");
 
   // Настройка пина для реле
   pinMode(RELAY_PIN, OUTPUT);
@@ -33,7 +31,7 @@ void setup() {
 
   // Настройка шаговых двигателей
   stepperX.setMaxSpeed(SPEED);
-  stepperX.setAcceleration(SPEED / 2);  // Ускорение в 2 раза меньше скорости
+  stepperX.setAcceleration(SPEED / 2);
 
   stepperY.setMaxSpeed(SPEED);
   stepperY.setAcceleration(SPEED / 2);
@@ -50,23 +48,29 @@ void deactivateRelay() {
 }
 
 void handleCommand(char command, int steps) {
-  if (command == 'L') stepperX.moveTo(stepperX.currentPosition() + steps);
-  if (command == 'R') stepperX.moveTo(stepperX.currentPosition() - steps);
-  if (command == 'T') stepperY.moveTo(stepperY.currentPosition() + steps);
-  if (command == 'B') stepperY.moveTo(stepperY.currentPosition() - steps);
-  if (command == 'F') activateRelay();
-  if (command == 'S') deactivateRelay();
+  switch (command) {
+    case 'L': stepperX.moveTo(stepperX.currentPosition() + steps); break;
+    case 'R': stepperX.moveTo(stepperX.currentPosition() - steps); break;
+    case 'T': stepperY.moveTo(stepperY.currentPosition() + steps); break;
+    case 'B': stepperY.moveTo(stepperY.currentPosition() - steps); break;
+    case 'F': activateRelay(); break;
+    case 'S': deactivateRelay(); break;
+    default:
+      Serial.println("Неизвестная команда");
+      return;
+  }
 
   String message = "MOVE " + String(command) + " " + String(steps);
-  Serial.println(message);
-  BTSerial.println(message);
+  Serial.println(message);  // Ответ по USB
 }
 
 void loop() {
-  // Читаем команды из Bluetooth
-  if (BTSerial.available() > 0) {
-    String command = BTSerial.readStringUntil('\n');
+  // Чтение команд через USB (Serial)
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
     command.trim();
+
+    if (command.length() < 2) return;
 
     char direction = command.charAt(0);
     int steps = command.substring(2).toInt();
@@ -74,7 +78,7 @@ void loop() {
     handleCommand(direction, steps);
   }
 
-  // Двигаем двигатели
+  // Обработка шагов моторов
   stepperX.run();
   stepperY.run();
 }
