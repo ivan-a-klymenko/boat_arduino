@@ -1,105 +1,132 @@
 #include <Arduino.h>
 #include <AccelStepper.h>
 
-// Пины для драйверов A4988 (оставлены как у тебя)
+// Пины драйверов A4988
 #define STEP_X 4
 #define DIR_X  5
 #define STEP_Y 6
 #define DIR_Y  7
 
-// Реле (активный LOW в твоём коде)
+// Реле (активный LOW)
 #define RELAY_PIN 8
 
+// Базовые параметры двигателя (оставлены разумные значения)
 #define STEPS_PER_REV 200
-const float SPEED = STEPS_PER_REV / 0.5;  // 2 об/с
+const float MAX_SPEED = STEPS_PER_REV / 0.5f; // 2 об/с = 400 шаг/с
 
-AccelStepper stepperX(AccelStepper::DRIVER, STEP_X, DIR_X);
-AccelStepper stepperY(AccelStepper::DRIVER, STEP_Y, DIR_Y);
+// === НАСТРОЙКА МАСШТАБА ПОЗИЦИИ → ШАГИ ===
+// 1 ед. по POWER/DIRECTION во сколько шагов?
+#define X_STEPS_PER_UNIT 1   // шаговик 1 (диапазон 0..30 ед.)
+#define Y_STEPS_PER_UNIT 1   // шаговик 2 (диапазон -30..30 ед.)
 
-// --- состояние реле по таймеру ---
+// Длительность импульса реле
+const unsigned long RELAY_PULSE_MS = 5000;
+
+// Два шаговых двигателя
+AccelStepper stepperX(AccelStepper::DRIVER, STEP_X, DIR_X); // Stepper 1 (POWER)
+AccelStepper stepperY(AccelStepper::DRIVER, STEP_Y, DIR_Y); // Stepper 2 (DIRECTION)
+
+// --- Состояние реле по таймеру ---
 bool relayActive = false;
 unsigned long relayOffAt = 0;
-int lastRelayDurationMs = 0;
 
-void relayOn(int durationMs) {
-  relayActive = true;
-  lastRelayDurationMs = durationMs;
-  relayOffAt = millis() + (durationMs > 0 ? durationMs : 5000);
-  digitalWrite(RELAY_PIN, LOW);           // включить (активный LOW)
-  Serial.print("RELAY ON ");
-  Serial.println(lastRelayDurationMs > 0 ? lastRelayDurationMs : 5000);
+// Утилита логов: эхо + ACK (для Android, чтобы видеть, что команда получена)
+static void ack(const String& recv, const String& info) {
+  Serial.print("RECV ");
+  Serial.println(recv);      // эхо полной полученной строки
+  Serial.print("ACK ");
+  Serial.println(info);      // краткое подтверждение
 }
 
-void relayOff() {
+static void relayOnFixed() {
+  relayActive = true;
+  relayOffAt = millis() + RELAY_PULSE_MS;
+  digitalWrite(RELAY_PIN, LOW); // активный LOW
+  Serial.print("RELAY ON ");
+  Serial.println(RELAY_PULSE_MS);
+}
+
+static void relayOff() {
   if (!relayActive) return;
   relayActive = false;
-  digitalWrite(RELAY_PIN, HIGH);          // выключить
+  digitalWrite(RELAY_PIN, HIGH);
   Serial.println("RELAY OFF");
 }
 
 void setup() {
   Serial.begin(115200);
   while (!Serial) { delay(10); }
-  Serial.println("READY");
 
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);          // по умолчанию выкл
+  digitalWrite(RELAY_PIN, HIGH); // по умолчанию выкл
 
-  stepperX.setMaxSpeed(SPEED);
-  stepperX.setAcceleration(SPEED / 2);
-  stepperY.setMaxSpeed(SPEED);
-  stepperY.setAcceleration(SPEED / 2);
+  // Настройка динамики (используем moveTo/run)
+  stepperX.setMaxSpeed(MAX_SPEED);
+  stepperX.setAcceleration(MAX_SPEED / 2);
+  stepperY.setMaxSpeed(MAX_SPEED);
+  stepperY.setAcceleration(MAX_SPEED / 2);
+
+  // Нулевая точка: при старте текущая позиция считается 0
+  stepperX.setCurrentPosition(0);
+  stepperY.setCurrentPosition(0);
+
+  Serial.println("READY");
 }
 
-static void handleMove(char command, int steps) {
-  switch (command) {
-    case 'L': stepperX.moveTo(stepperX.currentPosition() + steps); break;
-    case 'R': stepperX.moveTo(stepperX.currentPosition() - steps); break;
-    case 'T': stepperY.moveTo(stepperY.currentPosition() + steps); break;
-    case 'B': stepperY.moveTo(stepperY.currentPosition() - steps); break;
-    default:  Serial.println("ERR UNKNOWN MOVE"); return;
+static bool parseIntAfter(const String& upperLine, int startIdx, int& outVal) {
+  if (startIdx < 0 || startIdx >= (int)upperLine.length()) {
+    outVal = 0;
+    return true; // пустое → трактуем как 0
   }
-  Serial.print("MOVE ");
-  Serial.print(command);
-  Serial.print(' ');
-  Serial.println(steps);
+  String tail = upperLine.substring(startIdx);
+  tail.trim();
+  outVal = tail.toInt(); // допускает "+N" и "-N"
+  return true;
 }
 
 void loop() {
-  // Пришли данные по USB CDC?
+  // Парсинг команд по USB CDC
   if (Serial.available()) {
-    String line = Serial.readStringUntil('\n');
-    line.trim(); // убираем CR/LF
+    String raw = Serial.readStringUntil('\n'); // сохраним оригинал для эхо
+    raw.trim();
 
-    if (line.length() == 0) { /* пусто */ }
-    else if (line.charAt(0) == 'F') {
-      // Формат: "F <ms>"
-      int ms = 0;
-      if (line.length() > 1) {
-        ms = line.substring(1).toInt(); // допускаем "F 200" или "F200"
+    if (raw.length() > 0) {
+      String s = raw;
+      s.trim();
+      s.toUpperCase(); // регистронезависимо
+
+      if (s == "PING") {
+        ack(raw, "PONG");
+        Serial.println("PONG");
       }
-      if (ms <= 0) ms = 5000;
-      relayOn(ms);
-    }
-    else if (line.charAt(0) == 'S') {
-      relayOff();
-    }
-    else if (line.length() >= 3 && (line.charAt(0)=='L' || line.charAt(0)=='R' || line.charAt(0)=='T' || line.charAt(0)=='B')) {
-      int steps = line.substring(2).toInt();
-      handleMove(line.charAt(0), steps);
-    }
-    else if (line == "PING") {
-      Serial.println("PONG");
-    }
-    else if (line == "LED ON") {
-      // при желании можешь задействовать LED_BUILTIN
-      Serial.println("OK");
-    }
-    else if (line == "LED OFF") {
-      Serial.println("OK");
-    }
-    else {
-      Serial.println("ERR UNKNOWN");
+      else if (s.startsWith("POWER")) {
+        // Абсолютная позиция (ед.) в диапазоне 0..30 → конвертация в шаги
+        int val = 0;
+        parseIntAfter(s, 5, val); // символы после "POWER"
+        int units = constrain(val, 0, 30);
+        long targetSteps = (long)units * (long)X_STEPS_PER_UNIT;
+        stepperX.moveTo(targetSteps);
+        ack(raw, String("POWER -> pos ") + units + " (steps " + targetSteps + ")");
+      }
+      else if (s.startsWith("DIRECTION")) {
+        // Абсолютная позиция (ед.) в диапазоне -30..30 → конвертация в шаги
+        int val = 0;
+        parseIntAfter(s, 9, val); // символы после "DIRECTION"
+        int units = constrain(val, -30, 30);
+        long targetSteps = (long)units * (long)Y_STEPS_PER_UNIT;
+        stepperY.moveTo(targetSteps);
+        ack(raw, String("DIRECTION -> pos ") + units + " (steps " + targetSteps + ")");
+      }
+      else if (s == "RELAY") {
+        relayOnFixed(); // фиксированная длительность
+        ack(raw, "RELAY");
+      }
+      else {
+        // Неизвестная команда
+        Serial.print("RECV ");
+        Serial.println(raw);
+        Serial.println("ERR UNKNOWN");
+      }
     }
   }
 
@@ -108,7 +135,7 @@ void loop() {
     relayOff();
   }
 
-  // Движение шаговых
+  // Движение к целевой позиции (с ускорением)
   stepperX.run();
   stepperY.run();
 }
